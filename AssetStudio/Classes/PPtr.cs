@@ -1,4 +1,6 @@
-﻿namespace AssetStudio
+﻿using System;
+
+namespace AssetStudio
 {
     public sealed class PPtr<T> where T : Object
     {
@@ -33,10 +35,10 @@
                 if (index == -2)
                 {
                     var m_External = assetsFile.m_Externals[m_FileID - 1];
-                    var name = m_External.fileName.ToUpper();
+                    var name = m_External.fileName;
                     if (!assetsFileIndexCache.TryGetValue(name, out index))
                     {
-                        index = assetsFileList.FindIndex(x => x.upperFileName == name);
+                        index = assetsFileList.FindIndex(x => x.fileName.Equals(name, StringComparison.OrdinalIgnoreCase));
                         assetsFileIndexCache.Add(name, index);
                     }
                 }
@@ -55,7 +57,7 @@
         {
             if (TryGetAssetsFile(out var sourceFile))
             {
-                if (sourceFile.Objects.TryGetValue(m_PathID, out var obj))
+                if (sourceFile.ObjectsDic.TryGetValue(m_PathID, out var obj))
                 {
                     if (obj is T variable)
                     {
@@ -73,7 +75,7 @@
         {
             if (TryGetAssetsFile(out var sourceFile))
             {
-                if (sourceFile.Objects.TryGetValue(m_PathID, out var obj))
+                if (sourceFile.ObjectsDic.TryGetValue(m_PathID, out var obj))
                 {
                     if (obj is T2 variable)
                     {
@@ -86,5 +88,44 @@
             result = null;
             return false;
         }
+
+        public void Set(T m_Object)
+        {
+            var name = m_Object.assetsFile.fileName;
+            if (string.Equals(assetsFile.fileName, name, StringComparison.OrdinalIgnoreCase))
+            {
+                m_FileID = 0;
+            }
+            else
+            {
+                m_FileID = assetsFile.m_Externals.FindIndex(x => string.Equals(x.fileName, name, StringComparison.OrdinalIgnoreCase));
+                if (m_FileID == -1)
+                {
+                    assetsFile.m_Externals.Add(new FileIdentifier
+                    {
+                        fileName = m_Object.assetsFile.fileName
+                    });
+                    m_FileID = assetsFile.m_Externals.Count;
+                }
+                else
+                {
+                    m_FileID += 1;
+                }
+            }
+
+            var assetsManager = assetsFile.assetsManager;
+            var assetsFileList = assetsManager.assetsFileList;
+            var assetsFileIndexCache = assetsManager.assetsFileIndexCache;
+
+            if (!assetsFileIndexCache.TryGetValue(name, out index))
+            {
+                index = assetsFileList.FindIndex(x => x.fileName.Equals(name, StringComparison.OrdinalIgnoreCase));
+                assetsFileIndexCache.Add(name, index);
+            }
+
+            m_PathID = m_Object.m_PathID;
+        }
+
+        public bool IsNull => m_PathID == 0 || m_FileID < 0;
     }
 }

@@ -9,35 +9,48 @@ namespace AssetStudio
 {
     public static class SpriteHelper
     {
-        public static Bitmap GetImageFromSprite(Sprite m_Sprite)
+        public static Bitmap GetImage(this Sprite m_Sprite)
         {
             if (m_Sprite.m_SpriteAtlas != null && m_Sprite.m_SpriteAtlas.TryGet(out var m_SpriteAtlas))
             {
                 if (m_SpriteAtlas.m_RenderDataMap.TryGetValue(m_Sprite.m_RenderDataKey, out var spriteAtlasData) && spriteAtlasData.texture.TryGet(out var m_Texture2D))
                 {
-                    return CutImage(m_Texture2D, m_Sprite, spriteAtlasData.textureRect, spriteAtlasData.settingsRaw);
+                    return CutImage(m_Texture2D, m_Sprite, spriteAtlasData.textureRect, spriteAtlasData.textureRectOffset, spriteAtlasData.settingsRaw);
                 }
             }
             else
             {
                 if (m_Sprite.m_RD.texture.TryGet(out var m_Texture2D))
                 {
-                    return CutImage(m_Texture2D, m_Sprite, m_Sprite.m_RD.textureRect, m_Sprite.m_RD.settingsRaw);
+                    return CutImage(m_Texture2D, m_Sprite, m_Sprite.m_RD.textureRect, m_Sprite.m_RD.textureRectOffset, m_Sprite.m_RD.settingsRaw);
                 }
             }
             return null;
         }
 
-        private static Bitmap CutImage(Texture2D m_Texture2D, Sprite m_Sprite, RectangleF textureRect, SpriteSettings settingsRaw)
+        private static Bitmap CutImage(Texture2D m_Texture2D, Sprite m_Sprite, RectangleF textureRect, Vector2 textureRectOffset, SpriteSettings settingsRaw)
         {
-            var texture2D = new Texture2DConverter(m_Texture2D);
-            var originalImage = texture2D.ConvertToBitmap(false);
+            var originalImage = m_Texture2D.ConvertToBitmap(false);
             if (originalImage != null)
             {
                 using (originalImage)
                 {
-                    var spriteImage = originalImage.Clone(textureRect, PixelFormat.Format32bppArgb);
-
+                    //var spriteImage = originalImage.Clone(textureRect, PixelFormat.Format32bppArgb);
+                    var textureRectI = Rectangle.Round(textureRect);
+                    if (textureRectI.Width == 0)
+                    {
+                        textureRectI.Width = 1;
+                    }
+                    if (textureRectI.Height == 0)
+                    {
+                        textureRectI.Height = 1;
+                    }
+                    var spriteImage = new Bitmap(textureRectI.Width, textureRectI.Height, PixelFormat.Format32bppArgb);
+                    var destRect = new Rectangle(0, 0, textureRectI.Width, textureRectI.Height);
+                    using (var graphic = Graphics.FromImage(spriteImage))
+                    {
+                        graphic.DrawImage(originalImage, destRect, textureRectI, GraphicsUnit.Pixel);
+                    }
                     if (settingsRaw.packed == 1)
                     {
                         //RotateAndFlip
@@ -56,50 +69,52 @@ namespace AssetStudio
                                 spriteImage.RotateFlip(RotateFlipType.Rotate270FlipNone);
                                 break;
                         }
+                    }
 
-                        //Tight
-                        //TODO 2017 and up use m_PhysicsShape should be better
-                        if (settingsRaw.packingMode == SpritePackingMode.kSPMTight)
+                    //Tight
+                    if (settingsRaw.packingMode == SpritePackingMode.kSPMTight)
+                    {
+                        try
                         {
-                            try
+                            var triangles = GetTriangles(m_Sprite.m_RD);
+                            var points = triangles.Select(x => x.Select(y => new PointF(y.X, y.Y)).ToArray());
+                            using (var path = new GraphicsPath())
                             {
-                                var triangles = GetTriangles(m_Sprite.m_RD);
-                                var points = triangles.Select(x => x.Select(y => new PointF(y.X, y.Y)).ToArray());
-                                using (var path = new GraphicsPath())
+                                foreach (var p in points)
                                 {
-                                    foreach (var p in points)
+                                    path.AddPolygon(p);
+                                }
+                                using (var matr = new Matrix())
+                                {
+                                    var version = m_Sprite.version;
+                                    if (version[0] < 5
+                                       || (version[0] == 5 && version[1] < 4)
+                                       || (version[0] == 5 && version[1] == 4 && version[2] <= 1)) //5.4.1p3 down
                                     {
-                                        path.AddPolygon(p);
+                                        matr.Translate(m_Sprite.m_Rect.Width * 0.5f - textureRectOffset.X, m_Sprite.m_Rect.Height * 0.5f - textureRectOffset.Y);
                                     }
-                                    using (var matr = new Matrix())
+                                    else
                                     {
-                                        if (m_Sprite.m_Pivot == Vector2.Zero) //5.4.2 down
+                                        matr.Translate(m_Sprite.m_Rect.Width * m_Sprite.m_Pivot.X - textureRectOffset.X, m_Sprite.m_Rect.Height * m_Sprite.m_Pivot.Y - textureRectOffset.Y);
+                                    }
+                                    matr.Scale(m_Sprite.m_PixelsToUnits, m_Sprite.m_PixelsToUnits);
+                                    path.Transform(matr);
+                                    var bitmap = new Bitmap(textureRectI.Width, textureRectI.Height);
+                                    using (var graphic = Graphics.FromImage(bitmap))
+                                    {
+                                        using (var brush = new TextureBrush(spriteImage))
                                         {
-                                            matr.Translate(m_Sprite.m_Rect.Width * 0.5f, m_Sprite.m_Rect.Height * 0.5f);
-                                        }
-                                        else
-                                        {
-                                            matr.Translate(m_Sprite.m_Rect.Width * m_Sprite.m_Pivot.X, m_Sprite.m_Rect.Height * m_Sprite.m_Pivot.Y);
-                                        }
-                                        matr.Scale(m_Sprite.m_PixelsToUnits, m_Sprite.m_PixelsToUnits);
-                                        path.Transform(matr);
-                                        var bitmap = new Bitmap((int)textureRect.Width, (int)textureRect.Height);
-                                        using (var graphic = Graphics.FromImage(bitmap))
-                                        {
-                                            using (var brush = new TextureBrush(spriteImage))
-                                            {
-                                                graphic.FillPath(brush, path);
-                                                bitmap.RotateFlip(RotateFlipType.RotateNoneFlipY);
-                                                return bitmap;
-                                            }
+                                            graphic.FillPath(brush, path);
+                                            bitmap.RotateFlip(RotateFlipType.RotateNoneFlipY);
+                                            return bitmap;
                                         }
                                     }
                                 }
                             }
-                            catch
-                            {
-                                // ignored
-                            }
+                        }
+                        catch
+                        {
+                            // ignored
                         }
                     }
 

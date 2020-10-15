@@ -1,10 +1,23 @@
 ﻿using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 
 namespace AssetStudio
 {
+    public class MinMaxAABB
+    {
+        public Vector3 m_Min;
+        public Vector3 m_Max;
+
+        public MinMaxAABB(BinaryReader reader)
+        {
+            m_Min = reader.ReadVector3();
+            m_Max = reader.ReadVector3();
+        }
+    }
+
     public class CompressedMesh
     {
         public PackedFloatVector m_Vertices;
@@ -102,7 +115,7 @@ namespace AssetStudio
             stream = reader.ReadByte();
             offset = reader.ReadByte();
             format = reader.ReadByte();
-            dimension = reader.ReadByte();
+            dimension = (byte)(reader.ReadByte() & 0xF);
         }
     }
 
@@ -153,19 +166,19 @@ namespace AssetStudio
 
                 if (version[0] < 4) //4.0 down
                 {
-                    GetChannels();
+                    GetChannels(version);
                 }
             }
             else //5.0 and up
             {
-                GetStreams();
+                GetStreams(version);
             }
 
             m_DataSize = reader.ReadBytes(reader.ReadInt32());
             reader.AlignStream();
         }
 
-        public void GetStreams()
+        private void GetStreams(int[] version)
         {
             var streamCount = m_Channels.Max(x => x.stream) + 1;
             m_Streams = new StreamInfo[streamCount];
@@ -182,7 +195,7 @@ namespace AssetStudio
                         if (m_Channel.dimension > 0)
                         {
                             chnMask |= 1u << chn;
-                            stride += m_Channel.dimension * MeshHelper.GetChannelFormatSize(m_Channel.format);
+                            stride += m_Channel.dimension * MeshHelper.GetFormatSize(version, m_Channel.format);
                         }
                     }
                 }
@@ -200,7 +213,7 @@ namespace AssetStudio
             }
         }
 
-        private void GetChannels()
+        private void GetChannels(int[] version)
         {
             m_Channels = new ChannelInfo[6];
             for (int i = 0; i < 6; i++)
@@ -240,7 +253,7 @@ namespace AssetStudio
                                 m_Channel.dimension = 4;
                                 break;
                         }
-                        offset += (byte)(m_Channel.dimension * MeshHelper.GetChannelFormatSize(m_Channel.format));
+                        offset += (byte)(m_Channel.dimension * MeshHelper.GetFormatSize(version, m_Channel.format));
                     }
                 }
             }
@@ -383,11 +396,21 @@ namespace AssetStudio
         }
     }
 
+    public enum GfxPrimitiveType : int
+    {
+        kPrimitiveTriangles = 0,
+        kPrimitiveTriangleStrip = 1,
+        kPrimitiveQuads = 2,
+        kPrimitiveLines = 3,
+        kPrimitiveLineStrip = 4,
+        kPrimitivePoints = 5,
+    };
+
     public class SubMesh
     {
         public uint firstByte;
         public uint indexCount;
-        public int topology;
+        public GfxPrimitiveType topology;
         public uint triangleCount;
         public uint baseVertex;
         public uint firstVertex;
@@ -400,7 +423,7 @@ namespace AssetStudio
 
             firstByte = reader.ReadUInt32();
             indexCount = reader.ReadUInt32();
-            topology = reader.ReadInt32();
+            topology = (GfxPrimitiveType)reader.ReadInt32();
 
             if (version[0] < 4) //4.0 down
             {
@@ -423,7 +446,7 @@ namespace AssetStudio
 
     public sealed class Mesh : NamedObject
     {
-        private bool m_Use16BitIndices = true; //3.5.0 and newer always uses 16bit indices;
+        private bool m_Use16BitIndices = true;
         public SubMesh[] m_SubMeshes;
         private uint[] m_IndexBuffer;
         public BlendShapeData m_Shapes;
@@ -438,12 +461,16 @@ namespace AssetStudio
         public float[] m_UV1;
         public float[] m_UV2;
         public float[] m_UV3;
+        public float[] m_UV4;
+        public float[] m_UV5;
+        public float[] m_UV6;
+        public float[] m_UV7;
         public float[] m_Tangents;
         private VertexData m_VertexData;
         private CompressedMesh m_CompressedMesh;
         private StreamingInfo m_StreamData;
 
-        public List<uint> m_Indices = new List<uint>(); //use a list because I don't always know the facecount for triangle strips
+        public List<uint> m_Indices = new List<uint>();
 
         public Mesh(ObjectReader reader) : base(reader)
         {
@@ -490,8 +517,20 @@ namespace AssetStudio
                 var m_RootBoneNameHash = reader.ReadUInt32();
             }
 
-            if (version[0] > 2 || (version[0] == 2 && version[1] >= 6)) //2.6.0 and later
+            if (version[0] > 2 || (version[0] == 2 && version[1] >= 6)) //2.6.0 and up
             {
+                if (version[0] >= 2019) //2019 and up
+                {
+                    var m_BonesAABBSize = reader.ReadInt32();
+                    var m_BonesAABB = new MinMaxAABB[m_BonesAABBSize];
+                    for (int i = 0; i < m_BonesAABBSize; i++)
+                    {
+                        m_BonesAABB[i] = new MinMaxAABB(reader);
+                    }
+
+                    var m_VariableBoneCountWeights = reader.ReadUInt32Array();
+                }
+
                 var m_MeshCompression = reader.ReadByte();
                 if (version[0] >= 4)
                 {
@@ -511,6 +550,7 @@ namespace AssetStudio
                     ((version[0] == 2017 && version[1] == 3) && m_MeshCompression == 0))//2017.3.xfx with no compression
                 {
                     var m_IndexFormat = reader.ReadInt32();
+                    m_Use16BitIndices = m_IndexFormat == 0;
                 }
 
                 int m_IndexBuffer_size = reader.ReadInt32();
@@ -637,23 +677,6 @@ namespace AssetStudio
 
         private void ProcessData()
         {
-            //Fix normal channel in 2018.3 and up
-            if (version[0] > 2018 || (version[0] == 2018 && version[1] >= 3))
-            {
-                if (m_VertexData.m_Channels[1].dimension > 4)
-                {
-                    for (int i = 2; i < m_VertexData.m_Channels.Length; i++)
-                    {
-                        if (m_VertexData.m_Channels[i].dimension > 0)
-                        {
-                            var offset = m_VertexData.m_Channels[i].offset - m_VertexData.m_Channels[1].offset;
-                            m_VertexData.m_Channels[1].dimension = (byte)(offset / MeshHelper.GetChannelFormatSize(m_VertexData.m_Channels[1].format));
-                            m_VertexData.GetStreams();
-                            break;
-                        }
-                    }
-                }
-            }
             if (!string.IsNullOrEmpty(m_StreamData?.path))
             {
                 if (m_VertexData.m_VertexCount > 0)
@@ -662,7 +685,6 @@ namespace AssetStudio
                     m_VertexData.m_DataSize = resourceReader.GetData();
                 }
             }
-
             if (version[0] > 3 || (version[0] == 3 && version[1] >= 5)) //3.5 and up
             {
                 ReadVertexData();
@@ -673,7 +695,7 @@ namespace AssetStudio
                 DecompressCompressedMesh();
             }
 
-            BuildFaces();
+            GetTriangles();
         }
 
         private void ReadVertexData()
@@ -694,7 +716,7 @@ namespace AssetStudio
                             m_Channel.dimension = 4;
                         }
 
-                        var componentByteSize = (int)MeshHelper.GetChannelFormatSize(m_Channel.format);
+                        var componentByteSize = (int)MeshHelper.GetFormatSize(version, m_Channel.format);
                         var componentBytes = new byte[m_VertexCount * m_Channel.dimension * componentByteSize];
                         for (int v = 0; v < m_VertexCount; v++)
                         {
@@ -719,8 +741,8 @@ namespace AssetStudio
 
                         int[] componentsIntArray = null;
                         float[] componentsFloatArray = null;
-                        if (m_Channel.format == 11)
-                            componentsIntArray = MeshHelper.BytesToIntArray(componentBytes);
+                        if (MeshHelper.IsIntFormat(version, m_Channel.format))
+                            componentsIntArray = MeshHelper.BytesToIntArray(componentBytes, componentByteSize);
                         else
                             componentsFloatArray = MeshHelper.BytesToFloatArray(componentBytes, componentByteSize);
 
@@ -752,10 +774,18 @@ namespace AssetStudio
                                 case 7: //kShaderChannelTexCoord3
                                     m_UV3 = componentsFloatArray;
                                     break;
-                                //kShaderChannelTexCoord4 8
-                                //kShaderChannelTexCoord5 9
-                                //kShaderChannelTexCoord6 10
-                                //kShaderChannelTexCoord7 11
+                                case 8: //kShaderChannelTexCoord4
+                                    m_UV4 = componentsFloatArray;
+                                    break;
+                                case 9: //kShaderChannelTexCoord5
+                                    m_UV5 = componentsFloatArray;
+                                    break;
+                                case 10: //kShaderChannelTexCoord6
+                                    m_UV6 = componentsFloatArray;
+                                    break;
+                                case 11: //kShaderChannelTexCoord7
+                                    m_UV7 = componentsFloatArray;
+                                    break;
                                 //2018.2 and up
                                 case 12: //kShaderChannelBlendWeight
                                     if (m_Skin == null)
@@ -833,23 +863,40 @@ namespace AssetStudio
             if (m_CompressedMesh.m_Vertices.m_NumItems > 0)
             {
                 m_VertexCount = (int)m_CompressedMesh.m_Vertices.m_NumItems / 3;
-                m_Vertices = m_CompressedMesh.m_Vertices.UnpackFloats(3, 4);
+                m_Vertices = m_CompressedMesh.m_Vertices.UnpackFloats(3, 3 * 4);
             }
             //UV
             if (m_CompressedMesh.m_UV.m_NumItems > 0)
             {
-                m_UV0 = m_CompressedMesh.m_UV.UnpackFloats(2, 4, 0, m_VertexCount);
-                if (m_CompressedMesh.m_UV.m_NumItems >= m_VertexCount * 4)
+                var m_UVInfo = m_CompressedMesh.m_UVInfo;
+                if (m_UVInfo != 0)
                 {
-                    m_UV1 = m_CompressedMesh.m_UV.UnpackFloats(2, 4, m_VertexCount * 2, m_VertexCount);
+                    const int kInfoBitsPerUV = 4;
+                    const int kUVDimensionMask = 3;
+                    const int kUVChannelExists = 4;
+                    const int kMaxTexCoordShaderChannels = 8;
+
+                    int uvSrcOffset = 0;
+                    for (int uv = 0; uv < kMaxTexCoordShaderChannels; uv++)
+                    {
+                        var texCoordBits = m_UVInfo >> (uv * kInfoBitsPerUV);
+                        texCoordBits &= (1u << kInfoBitsPerUV) - 1u;
+                        if ((texCoordBits & kUVChannelExists) != 0)
+                        {
+                            var uvDim = 1 + (int)(texCoordBits & kUVDimensionMask);
+                            var m_UV = m_CompressedMesh.m_UV.UnpackFloats(uvDim, uvDim * 4, uvSrcOffset, m_VertexCount);
+                            SetUV(uv, m_UV);
+                            uvSrcOffset += uvDim * m_VertexCount;
+                        }
+                    }
                 }
-                if (m_CompressedMesh.m_UV.m_NumItems >= m_VertexCount * 6)
+                else
                 {
-                    m_UV2 = m_CompressedMesh.m_UV.UnpackFloats(2, 4, m_VertexCount * 4, m_VertexCount);
-                }
-                if (m_CompressedMesh.m_UV.m_NumItems >= m_VertexCount * 8)
-                {
-                    m_UV3 = m_CompressedMesh.m_UV.UnpackFloats(2, 4, m_VertexCount * 6, m_VertexCount);
+                    m_UV0 = m_CompressedMesh.m_UV.UnpackFloats(2, 2 * 4, 0, m_VertexCount);
+                    if (m_CompressedMesh.m_UV.m_NumItems >= m_VertexCount * 4)
+                    {
+                        m_UV1 = m_CompressedMesh.m_UV.UnpackFloats(2, 2 * 4, m_VertexCount * 2, m_VertexCount);
+                    }
                 }
             }
             //BindPose
@@ -1001,7 +1048,7 @@ namespace AssetStudio
             }
         }
 
-        private void BuildFaces()
+        private void GetTriangles()
         {
             foreach (var m_SubMesh in m_SubMeshes)
             {
@@ -1010,43 +1057,65 @@ namespace AssetStudio
                 {
                     firstIndex /= 2;
                 }
-
-                if (m_SubMesh.topology == 0)
+                var indexCount = m_SubMesh.indexCount;
+                var topology = m_SubMesh.topology;
+                if (topology == GfxPrimitiveType.kPrimitiveTriangles)
                 {
-                    for (int i = 0; i < m_SubMesh.indexCount / 3; i++)
+                    for (int i = 0; i < indexCount; i += 3)
                     {
-                        m_Indices.Add(m_IndexBuffer[firstIndex + i * 3]);
-                        m_Indices.Add(m_IndexBuffer[firstIndex + i * 3 + 1]);
-                        m_Indices.Add(m_IndexBuffer[firstIndex + i * 3 + 2]);
+                        m_Indices.Add(m_IndexBuffer[firstIndex + i]);
+                        m_Indices.Add(m_IndexBuffer[firstIndex + i + 1]);
+                        m_Indices.Add(m_IndexBuffer[firstIndex + i + 2]);
                     }
+                }
+                else if (version[0] < 4 || topology == GfxPrimitiveType.kPrimitiveTriangleStrip)
+                {
+                    // de-stripify :
+                    uint triIndex = 0;
+                    for (int i = 0; i < indexCount - 2; i++)
+                    {
+                        var a = m_IndexBuffer[firstIndex + i];
+                        var b = m_IndexBuffer[firstIndex + i + 1];
+                        var c = m_IndexBuffer[firstIndex + i + 2];
+
+                        // skip degenerates
+                        if (a == b || a == c || b == c)
+                            continue;
+
+                        // do the winding flip-flop of strips :
+                        if ((i & 1) == 1)
+                        {
+                            m_Indices.Add(b);
+                            m_Indices.Add(a);
+                        }
+                        else
+                        {
+                            m_Indices.Add(a);
+                            m_Indices.Add(b);
+                        }
+                        m_Indices.Add(c);
+                        triIndex += 3;
+                    }
+                    //fix indexCount
+                    m_SubMesh.indexCount = triIndex;
+                }
+                else if (topology == GfxPrimitiveType.kPrimitiveQuads)
+                {
+                    for (int q = 0; q < indexCount; q += 4)
+                    {
+                        m_Indices.Add(m_IndexBuffer[firstIndex + q]);
+                        m_Indices.Add(m_IndexBuffer[firstIndex + q + 1]);
+                        m_Indices.Add(m_IndexBuffer[firstIndex + q + 2]);
+                        m_Indices.Add(m_IndexBuffer[firstIndex + q]);
+                        m_Indices.Add(m_IndexBuffer[firstIndex + q + 2]);
+                        m_Indices.Add(m_IndexBuffer[firstIndex + q + 3]);
+                    }
+                    //fix indexCount
+                    m_SubMesh.indexCount = indexCount / 2 * 3;
                 }
                 else
                 {
-                    uint j = 0;
-                    for (int i = 0; i < m_SubMesh.indexCount - 2; i++)
-                    {
-                        uint fa = m_IndexBuffer[firstIndex + i];
-                        uint fb = m_IndexBuffer[firstIndex + i + 1];
-                        uint fc = m_IndexBuffer[firstIndex + i + 2];
-
-                        if ((fa != fb) && (fa != fc) && (fc != fb))
-                        {
-                            m_Indices.Add(fa);
-                            if ((i % 2) == 0)
-                            {
-                                m_Indices.Add(fb);
-                                m_Indices.Add(fc);
-                            }
-                            else
-                            {
-                                m_Indices.Add(fc);
-                                m_Indices.Add(fb);
-                            }
-                            j++;
-                        }
-                    }
-                    //fix indexCount
-                    m_SubMesh.indexCount = j * 3;
+                    throw new NotSupportedException("Failed getting triangles. Submesh topology is lines or points.");
                 }
             }
         }
@@ -1059,26 +1128,211 @@ namespace AssetStudio
                 m_Skin[i] = new BoneWeights4();
             }
         }
+
+        private void SetUV(int uv, float[] m_UV)
+        {
+            switch (uv)
+            {
+                case 0:
+                    m_UV0 = m_UV;
+                    break;
+                case 1:
+                    m_UV1 = m_UV;
+                    break;
+                case 2:
+                    m_UV2 = m_UV;
+                    break;
+                case 3:
+                    m_UV3 = m_UV;
+                    break;
+                case 4:
+                    m_UV4 = m_UV;
+                    break;
+                case 5:
+                    m_UV5 = m_UV;
+                    break;
+                case 6:
+                    m_UV6 = m_UV;
+                    break;
+                case 7:
+                    m_UV7 = m_UV;
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+        }
+
+        public float[] GetUV(int uv)
+        {
+            switch (uv)
+            {
+                case 0:
+                    return m_UV0;
+                case 1:
+                    return m_UV1;
+                case 2:
+                    return m_UV2;
+                case 3:
+                    return m_UV3;
+                case 4:
+                    return m_UV4;
+                case 5:
+                    return m_UV5;
+                case 6:
+                    return m_UV6;
+                case 7:
+                    return m_UV7;
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+        }
     }
 
     public static class MeshHelper
     {
-        public static uint GetChannelFormatSize(int format)
+        private enum VertexChannelFormat
         {
-            switch (format)
+            kChannelFormatFloat,
+            kChannelFormatFloat16,
+            kChannelFormatColor,
+            kChannelFormatByte,
+            kChannelFormatUInt32
+        }
+
+        private enum VertexFormat
+        {
+            kVertexFormatFloat,
+            kVertexFormatFloat16,
+            kVertexFormatColor,
+            kVertexFormatUNorm8,
+            kVertexFormatSNorm8,
+            kVertexFormatUNorm16,
+            kVertexFormatSNorm16,
+            kVertexFormatUInt8,
+            kVertexFormatSInt8,
+            kVertexFormatUInt16,
+            kVertexFormatSInt16,
+            kVertexFormatUInt32,
+            kVertexFormatSInt32
+        }
+
+        private enum VertexFormatV2019
+        {
+            kVertexFormatFloat,
+            kVertexFormatFloat16,
+            kVertexFormatUNorm8,
+            kVertexFormatSNorm8,
+            kVertexFormatUNorm16,
+            kVertexFormatSNorm16,
+            kVertexFormatUInt8,
+            kVertexFormatSInt8,
+            kVertexFormatUInt16,
+            kVertexFormatSInt16,
+            kVertexFormatUInt32,
+            kVertexFormatSInt32
+        }
+
+        public static uint GetFormatSize(int[] version, int format)
+        {
+            if (version[0] < 2017)
             {
-                case 0: //kChannelFormatFloat
-                    return 4u;
-                case 1: //kChannelFormatFloat16
-                    return 2u;
-                case 2: //kChannelFormatColor
-                    return 1u;
-                case 3: //kChannelFormatByte
-                    return 1u;
-                case 11: //kChannelFormatInt32
-                    return 4u;
-                default:
-                    return 0;
+                switch ((VertexChannelFormat)format)
+                {
+                    case VertexChannelFormat.kChannelFormatFloat:
+                        return 4u;
+                    case VertexChannelFormat.kChannelFormatFloat16:
+                        return 2u;
+                    case VertexChannelFormat.kChannelFormatColor: //in 4.x is size 4
+                        return 1u;
+                    case VertexChannelFormat.kChannelFormatByte:
+                        return 1u;
+                    case VertexChannelFormat.kChannelFormatUInt32: //in 5.x
+                        return 4u;
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(format), format, null);
+                }
+            }
+            else if (version[0] < 2019)
+            {
+                switch ((VertexFormat)format)
+                {
+                    case VertexFormat.kVertexFormatFloat:
+                        return 4u;
+                    case VertexFormat.kVertexFormatFloat16:
+                        return 2u;
+                    case VertexFormat.kVertexFormatColor:
+                        return 1u;
+                    case VertexFormat.kVertexFormatUNorm8:
+                        return 1u;
+                    case VertexFormat.kVertexFormatSNorm8:
+                        return 1u;
+                    case VertexFormat.kVertexFormatUNorm16:
+                        return 2u;
+                    case VertexFormat.kVertexFormatSNorm16:
+                        return 2u;
+                    case VertexFormat.kVertexFormatUInt8:
+                        return 1u;
+                    case VertexFormat.kVertexFormatSInt8:
+                        return 1u;
+                    case VertexFormat.kVertexFormatUInt16:
+                        return 2u;
+                    case VertexFormat.kVertexFormatSInt16:
+                        return 2u;
+                    case VertexFormat.kVertexFormatUInt32:
+                        return 4u;
+                    case VertexFormat.kVertexFormatSInt32:
+                        return 4u;
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(format), format, null);
+                }
+            }
+            else
+            {
+                switch ((VertexFormatV2019)format)
+                {
+                    case VertexFormatV2019.kVertexFormatFloat:
+                        return 4u;
+                    case VertexFormatV2019.kVertexFormatFloat16:
+                        return 2u;
+                    case VertexFormatV2019.kVertexFormatUNorm8:
+                        return 1u;
+                    case VertexFormatV2019.kVertexFormatSNorm8:
+                        return 1u;
+                    case VertexFormatV2019.kVertexFormatUNorm16:
+                        return 2u;
+                    case VertexFormatV2019.kVertexFormatSNorm16:
+                        return 2u;
+                    case VertexFormatV2019.kVertexFormatUInt8:
+                        return 1u;
+                    case VertexFormatV2019.kVertexFormatSInt8:
+                        return 1u;
+                    case VertexFormatV2019.kVertexFormatUInt16:
+                        return 2u;
+                    case VertexFormatV2019.kVertexFormatSInt16:
+                        return 2u;
+                    case VertexFormatV2019.kVertexFormatUInt32:
+                        return 4u;
+                    case VertexFormatV2019.kVertexFormatSInt32:
+                        return 4u;
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(format), format, null);
+                }
+            }
+        }
+
+        public static bool IsIntFormat(int[] version, int format)
+        {
+            if (version[0] < 2017)
+            {
+                return format == 4;
+            }
+            else if (version[0] < 2019)
+            {
+                return format >= 7;
+            }
+            else
+            {
+                return format >= 6;
             }
         }
 
@@ -1105,12 +1359,23 @@ namespace AssetStudio
             return result;
         }
 
-        public static int[] BytesToIntArray(byte[] inputBytes)
+        public static int[] BytesToIntArray(byte[] inputBytes, int size)
         {
-            var result = new int[inputBytes.Length / 4];
-            for (int i = 0; i < inputBytes.Length / 4; i++)
+            var result = new int[inputBytes.Length / size];
+            for (int i = 0; i < inputBytes.Length / size; i++)
             {
-                result[i] = BitConverter.ToInt32(inputBytes, i * 4);
+                switch (size)
+                {
+                    case 1:
+                        result[i] = inputBytes[i];
+                        break;
+                    case 2:
+                        result[i] = BitConverter.ToInt16(inputBytes, i * 2);
+                        break;
+                    case 4:
+                        result[i] = BitConverter.ToInt32(inputBytes, i * 4);
+                        break;
+                }
             }
             return result;
         }
